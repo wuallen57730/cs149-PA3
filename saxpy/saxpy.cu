@@ -81,10 +81,8 @@ void saxpyCuda(int N, float alpha, float* xarray, float* yarray, float* resultar
     // 啟動 CUDA kernel。
     // 這裡的 <<< >>> 表示這是 CUDA kernel launch。
     // GPU 的實際計算會在這一行發生。
-    double kernelStartTime = CycleTimer::currentSeconds();
     saxpy_kernel<<<blocks, threadsPerBlock>>>(N, alpha, device_x, device_y, device_result);
     cudaDeviceSynchronize();
-    double kernelEndTime = CycleTimer::currentSeconds();
 
     //
     // CS149 TODO：使用 cudaMemcpy 將結果從 GPU 複製回 CPU。
