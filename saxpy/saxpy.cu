@@ -7,26 +7,23 @@
 #include "CycleTimer.h"
 
 
-// return GB/sec
+// 回傳 GB/sec
 float GBPerSec(int bytes, float sec) {
   return static_cast<float>(bytes) / (1024. * 1024. * 1024.) / sec;
 }
 
 
-// This is the CUDA "kernel" function that is run on the GPU.  You
-// know this because it is marked as a __global__ function.
+// 這是會在 GPU 上執行的 CUDA kernel 函式。
+// 你可以從它被標記為 __global__ 來判斷。
 __global__ void
 saxpy_kernel(int N, float alpha, float* x, float* y, float* result) {
 
-    // compute overall thread index from position of thread in current
-    // block, and given the block we are in (in this example only a 1D
-    // calculation is needed so the code only looks at the .x terms of
-    // blockDim and threadIdx.
+    // 計算這個 thread 在整個網格中的總索引。
+    // 在這個範例中只需要一維計算，所以只看 blockDim.x 和 threadIdx.x。
     int index = blockIdx.x * blockDim.x + threadIdx.x;
 
 
-    // this check is necessary to make the code work for values of N
-    // that are not a multiple of the thread block size (blockDim.x)
+    // 這個檢查是必要的，因為 N 可能不是 thread block 大小的倍數。
     if (index < N)
        result[index] = alpha * x[index] + y[index];
 }
@@ -34,66 +31,67 @@ saxpy_kernel(int N, float alpha, float* x, float* y, float* result) {
 
 // saxpyCuda --
 //
-// This function is regular C code running on the CPU.  It allocates
-// memory on the GPU using CUDA API functions, uses CUDA API functions
-// to transfer data from the CPU's memory address space to GPU memory
-// address space, and launches the CUDA kernel function on the GPU.
+// 這個函式是 CPU 上執行的常規 C 程式碼。
+// 它會使用 CUDA API 在 GPU 上配置記憶體、
+// 將 CPU 記憶體中的資料搬移到 GPU、
+// 並啟動 GPU 上的 kernel 函式。
 void saxpyCuda(int N, float alpha, float* xarray, float* yarray, float* resultarray) {
 
-    // must read both input arrays (xarray and yarray) and write to
-    // output array (resultarray)
+    // 這個函式必須讀取兩個輸入陣列 (xarray 和 yarray)，
+    // 並把結果寫入輸出陣列 (resultarray)。
     int totalBytes = sizeof(float) * 3 * N;
 
-    // compute number of blocks and threads per block.  In this
-    // application we've hardcoded thread blocks to contain 512 CUDA
-    // threads.
+    // 計算 block 數量與每個 block 的 thread 數。
+    // 在這個範例中，我們把每個 thread block 固定為 512 個 CUDA thread。
     const int threadsPerBlock = 512;
 
-    // Notice the round up here.  The code needs to compute the number
-    // of threads blocks needed such that there is one thread per
-    // element of the arrays.  This code is written to work for values
-    // of N that are not multiples of threadPerBlock.
+    // 這裡做向上取整，確保能為每個元素分配一個 thread。
+    // 這段程式可以處理 N 不是 threadPerBlock 倍數的情況。
     const int blocks = (N + threadsPerBlock - 1) / threadsPerBlock;
 
-    // These are pointers that will be pointers to memory allocated
-    // *one the GPU*.  You should allocate these pointers via
-    // cudaMalloc.  You can access the resulting buffers from CUDA
-    // device kernel code (see the kernel function saxpy_kernel()
-    // above) but you cannot access the contents these buffers from
-    // this thread. CPU threads cannot issue loads and stores from GPU
-    // memory!
+    // 這些指標將指向在 GPU 上配置的記憶體。
+    // 你應該使用 cudaMalloc 來分配它們。
+    // 這些 buffer 可以在 CUDA device kernel 程式中存取，
+    // 但這個 CPU 執行緒無法直接讀寫 GPU 記憶體中的內容。
     float* device_x = nullptr;
     float* device_y = nullptr;
     float* device_result = nullptr;
     
     //
-    // CS149 TODO: allocate device memory buffers on the GPU using cudaMalloc.
+    // CS149 TODO：使用 cudaMalloc 在 GPU 上配置 device memory buffer。
     //
-    // We highly recommend taking a look at NVIDIA's
-    // tutorial, which clearly walks you through the few lines of code
-    // you need to write for this part of the assignment:
+    // 我們非常推薦你看 NVIDIA 的教學，
+    // 這裡有非常清楚的範例可以一步一步跟著做：
     //
     // https://devblogs.nvidia.com/easy-introduction-cuda-c-and-c/
     //
-        
-    // start timing after allocation of device memory
+    cudaMalloc(&device_x, sizeof(float) * N);
+    cudaMalloc(&device_y, sizeof(float) * N);
+    cudaMalloc(&device_result, sizeof(float) * N);
+    // 在配置完 device memory 後開始計時。
     double startTime = CycleTimer::currentSeconds();
 
     //
-    // CS149 TODO: copy input arrays to the GPU using cudaMemcpy
+    // CS149 TODO：使用 cudaMemcpy 將輸入陣列複製到 GPU。
     //
+    cudaMemcpy(device_x, xarray, sizeof(float) * N, cudaMemcpyHostToDevice);
+    cudaMemcpy(device_y, yarray, sizeof(float) * N, cudaMemcpyHostToDevice);
 
    
-    // run CUDA kernel. (notice the <<< >>> brackets indicating a CUDA
-    // kernel launch) Execution on the GPU occurs here.
+    // 啟動 CUDA kernel。
+    // 這裡的 <<< >>> 表示這是 CUDA kernel launch。
+    // GPU 的實際計算會在這一行發生。
+    double kernelStartTime = CycleTimer::currentSeconds();
     saxpy_kernel<<<blocks, threadsPerBlock>>>(N, alpha, device_x, device_y, device_result);
+    cudaDeviceSynchronize();
+    double kernelEndTime = CycleTimer::currentSeconds();
 
     //
-    // CS149 TODO: copy result from GPU back to CPU using cudaMemcpy
+    // CS149 TODO：使用 cudaMemcpy 將結果從 GPU 複製回 CPU。
     //
-
+    cudaMemcpy(resultarray, device_result, sizeof(float) * N, cudaMemcpyDeviceToHost);
     
-    // end timing after result has been copied back into host memory
+    // 在結果已經複製回 host memory 之後結束計時。
     double endTime = CycleTimer::currentSeconds();
 
     cudaError_t errCode = cudaPeekAtLastError();
@@ -102,19 +100,24 @@ void saxpyCuda(int N, float alpha, float* xarray, float* yarray, float* resultar
 		errCode, cudaGetErrorString(errCode));
     }
 
+    double kernelDuration = kernelEndTime - kernelStartTime;
+    printf("Effective BW by CUDA kernel only: %.3f ms\t\t[%.3f GB/s]\n", 1000.f * kernelDuration, GBPerSec(totalBytes, kernelDuration));
+
     double overallDuration = endTime - startTime;
     printf("Effective BW by CUDA saxpy: %.3f ms\t\t[%.3f GB/s]\n", 1000.f * overallDuration, GBPerSec(totalBytes, overallDuration));
 
     //
-    // CS149 TODO: free memory buffers on the GPU using cudaFree
+    // CS149 TODO：使用 cudaFree 釋放 GPU 上的記憶體 buffer。
     //
-    
+    cudaFree(device_x);
+    cudaFree(device_y);
+    cudaFree(device_result);
 }
 
 void printCudaInfo() {
 
-    // print out stats about the GPU in the machine.  Useful if
-    // students want to know what GPU they are running on.
+    // 印出這台機器上的 GPU 統計資訊。
+    // 如果你想知道自己跑在哪張 GPU 上，這很有用。
 
     int deviceCount = 0;
     cudaError_t err = cudaGetDeviceCount(&deviceCount);
