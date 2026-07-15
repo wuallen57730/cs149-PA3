@@ -386,44 +386,111 @@ shadePixel(int circleIndex, float2 pixelCenter, float3 p, float4* imagePtr) {
 // resulting image will be incorrect.
 __global__ void kernelRenderCircles() {
 
-    int index = blockIdx.x * blockDim.x + threadIdx.x;
+    int pixelX = blockIdx.x * blockDim.x + threadIdx.x;
+    int pixelY = blockIdx.y * blockDim.y + threadIdx.y;
 
-    if (index >= cuConstRendererParams.numCircles)
-        return;
+    int width = cuConstRendererParams.imageWidth;
+    int height = cuConstRendererParams.imageHeight;
+    bool activePixel = (pixelX < width && pixelY < height);
 
-    int index3 = 3 * index;
+    float4 pixelColor;
+    float4* pixelPtr = NULL;
+    if (activePixel) {
+        // 這個 pixel 在 imageData 中的起始位置
+        int pixelIndex = 4 * (pixelY * width + pixelX);
+        pixelPtr = (float4*)(&cuConstRendererParams.imageData[pixelIndex]);
 
-    // read position and radius
-    float3 p = *(float3*)(&cuConstRendererParams.position[index3]);
-    float  rad = cuConstRendererParams.radius[index];
+        // 先把目前背景色讀到暫存器，之後所有 circle 都在 local 端累積
+        pixelColor = *pixelPtr;
+    }
 
-    // compute the bounding box of the circle. The bound is in integer
-    // screen coordinates, so it's clamped to the edges of the screen.
-    short imageWidth = cuConstRendererParams.imageWidth;
-    short imageHeight = cuConstRendererParams.imageHeight;
-    short minX = static_cast<short>(imageWidth * (p.x - rad));
-    short maxX = static_cast<short>(imageWidth * (p.x + rad)) + 1;
-    short minY = static_cast<short>(imageHeight * (p.y - rad));
-    short maxY = static_cast<short>(imageHeight * (p.y + rad)) + 1;
+    float invWidth = 1.f / width;
+    float invHeight = 1.f / height;
+    float2 pixelCenterNorm = make_float2(
+        invWidth * (pixelX + 0.5f),
+        invHeight * (pixelY + 0.5f)
+    );
 
-    // a bunch of clamps.  Is there a CUDA built-in for this?
-    short screenMinX = (minX > 0) ? ((minX < imageWidth) ? minX : imageWidth) : 0;
-    short screenMaxX = (maxX > 0) ? ((maxX < imageWidth) ? maxX : imageWidth) : 0;
-    short screenMinY = (minY > 0) ? ((minY < imageHeight) ? minY : imageHeight) : 0;
-    short screenMaxY = (maxY > 0) ? ((maxY < imageHeight) ? maxY : imageHeight) : 0;
+    // 一次載入一批 circles 到 shared memory
+    extern __shared__ unsigned char sharedBytes[];
+    float3* sharedPosition = (float3*)sharedBytes;
+    float* sharedRadius = (float*)&sharedPosition[blockDim.x * blockDim.y];
+    float3* sharedColor = (float3*)&sharedRadius[blockDim.x * blockDim.y];
 
-    float invWidth = 1.f / imageWidth;
-    float invHeight = 1.f / imageHeight;
+    int circlesPerTile = blockDim.x * blockDim.y;
+    int numCircles = cuConstRendererParams.numCircles;
 
-    // for all pixels in the bonding box
-    for (int pixelY=screenMinY; pixelY<screenMaxY; pixelY++) {
-        float4* imgPtr = (float4*)(&cuConstRendererParams.imageData[4 * (pixelY * imageWidth + screenMinX)]);
-        for (int pixelX=screenMinX; pixelX<screenMaxX; pixelX++) {
-            float2 pixelCenterNorm = make_float2(invWidth * (static_cast<float>(pixelX) + 0.5f),
-                                                 invHeight * (static_cast<float>(pixelY) + 0.5f));
-            shadePixel(index, pixelCenterNorm, p, imgPtr);
-            imgPtr++;
+
+    // 依照輸入順序，逐一處理所有 circles
+    for (int circleBase = 0; circleBase < numCircles; circleBase += circlesPerTile) {
+        int localCircle = threadIdx.y * blockDim.x + threadIdx.x;
+        int circleIndex = circleBase + localCircle;
+
+        if (circleIndex < numCircles) {
+            int index3 = 3 * circleIndex;
+            sharedPosition[localCircle] = *((float3*)(&cuConstRendererParams.position[index3]));
+            sharedRadius[localCircle] = cuConstRendererParams.radius[circleIndex];
+            
+            if (cuConstRendererParams.sceneName != SNOWFLAKES && 
+                cuConstRendererParams.sceneName != SNOWFLAKES_SINGLE_FRAME) {
+                sharedColor[localCircle] = *((float3*)(&cuConstRendererParams.color[index3]));
+            }
         }
+
+        __syncthreads();
+
+        int circlesInTile = ((numCircles - circleBase) < circlesPerTile)
+            ? (numCircles - circleBase)
+            : circlesPerTile;
+        for (int i = 0; i < circlesInTile; ++i) {
+            if (!activePixel)
+                continue;
+
+            float3 p = sharedPosition[i];
+            float rad = sharedRadius[i];
+
+            float diffX = p.x - pixelCenterNorm.x;
+            float diffY = p.y - pixelCenterNorm.y;
+            float pixelDist = diffX * diffX + diffY * diffY;
+
+            if (pixelDist > rad * rad) {
+                // 這個 pixel 不在 circle 的範圍內，跳過
+                continue;
+            }
+
+            float3 rgb;
+            float alpha;
+
+            if (cuConstRendererParams.sceneName == SNOWFLAKES || 
+                cuConstRendererParams.sceneName == SNOWFLAKES_SINGLE_FRAME) {
+                const float kCircleMaxAlpha = .5f;
+                const float falloffScale = 4.f;
+
+                float normPixelDist = sqrt(pixelDist) / rad;
+                rgb = lookupColor(normPixelDist);
+
+                float maxAlpha = .6f + .4f * (1.f-p.z);
+                maxAlpha = kCircleMaxAlpha * fmaxf(fminf(maxAlpha, 1.f), 0.f); // kCircleMaxAlpha * clamped value
+                alpha = maxAlpha * exp(-1.f * falloffScale * normPixelDist * normPixelDist);
+
+            } else {
+                // 一般 scene 直接讀 circle 顏色
+                rgb = sharedColor[i];
+                alpha = .5f;
+            }
+        
+            float oneMinusAlpha = 1.f - alpha;
+            pixelColor.x = alpha * rgb.x + oneMinusAlpha * pixelColor.x;
+            pixelColor.y = alpha * rgb.y + oneMinusAlpha * pixelColor.y;
+            pixelColor.z = alpha * rgb.z + oneMinusAlpha * pixelColor.z;
+            pixelColor.w = alpha + pixelColor.w;
+        }
+
+        __syncthreads();
+    }
+
+    if (activePixel) {
+        *pixelPtr = pixelColor;
     }
 }
 
@@ -636,10 +703,17 @@ CudaRenderer::advanceAnimation() {
 void
 CudaRenderer::render() {
 
-    // 256 threads per block is a healthy number
-    dim3 blockDim(256, 1);
-    dim3 gridDim((numCircles + blockDim.x - 1) / blockDim.x);
+    // Phase 1：每個 thread 負責一個 pixel（2D grid 覆蓋整張圖）
+    dim3 blockDim(16, 16, 1);
+    dim3 gridDim(
+        (image->width + blockDim.x - 1) / blockDim.x,
+        (image->height + blockDim.y - 1) / blockDim.y);
 
-    kernelRenderCircles<<<gridDim, blockDim>>>();
+    int circlesPerTile = blockDim.x * blockDim.y;
+    size_t sharedBytes = sizeof(float3) * circlesPerTile
+                       + sizeof(float) * circlesPerTile
+                       + sizeof(float3) * circlesPerTile;
+
+    kernelRenderCircles<<<gridDim, blockDim, sharedBytes>>>();
     cudaDeviceSynchronize();
 }
